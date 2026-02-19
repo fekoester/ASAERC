@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.env
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data / outputs
+data/
+runs/
+saved_models/
+processed_data/
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/
