@@ -5,17 +5,12 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import numpy as np
 import torch
 import yaml
-from torch.utils.data import DataLoader, TensorDataset
 
-from asaerc import (
-    AttentionReadout2DPDE,
-    PDETrainer,
-    build_pde_reservoir_compiled,
-    load_data_files_whole,
-    simulate_pde_for_file,
-)
+from asaerc.diagnostics.corr import compute_correlation_mats
+from asaerc.experiment import evaluate_readout, forecast_vpt, simulate_dataset, train_readout
 from asaerc.utils.seed import seed_all
 
 
@@ -60,10 +55,18 @@ class Config:
     seed: int = 0
     save_dir: str = "runs"
     save_corr: bool = True
+    corr_steps: int = 500  # input steps used for the correlation diagnostics
+
+    # "next": predict y_{t+1}; "delta": predict y_{t+1} - x_t (much harder to game by copying x_t)
+    target_mode: str = "next"
+
+    # Closed-loop forecast (0 disables): warm up on the start of each test segment, then predict.
+    forecast_steps: int = 0
+    forecast_warmup: int = 200
 
 
 def load_config(path: str) -> Config:
-    with open(path, "r") as f:
+    with open(path) as f:
         d = yaml.safe_load(f)
     return Config(**d)
 
@@ -88,170 +91,79 @@ def main():
     with open(run_dir / "config.json", "w") as f:
         json.dump(asdict(cfg), f, indent=2)
 
-    # load data
-    file_list = load_data_files_whole(cfg.processed_dir, cfg.input_dim, cfg.output_dim)
-
-    # build reservoir
-    pde_res = build_pde_reservoir_compiled(
-        input_size=cfg.input_dim,
-        n_injection_points=cfg.n_injection_points,
-        n_measurement_points=cfg.n_measurement_points,
-        use_injection_as_sensors=cfg.use_injection_as_sensors,
-        Nx=cfg.Nx,
-        Ny=cfg.Ny,
-        mode=cfg.mode,
-        c=cfg.c,
-        D=cfg.D,
-        gamma=cfg.gamma,
-        boundary=cfg.boundary,
-        steps_per_input=cfg.steps_per_input,
-        dx=cfg.dx,
-        dy=cfg.dy,
-        dt=cfg.dt,
-        device=str(device),
-        forcing_type=cfg.forcing_type,
-    )
-
-    # simulate each file, create per-file splits
-    filewise = {}
-    train_meas, train_field, train_targ = [], [], []
-    for fname, arr_in, arr_tg in file_list:
-        meas_cpu, field_cpu, targ_cpu = simulate_pde_for_file(
-            pde_res, arr_in, arr_tg, device=device
-        )
-        T = meas_cpu.size(0)
-        if T < 2:
-            continue
-        cutoff = int(cfg.train_frac * T)
-
-        filewise[fname] = dict(
-            train_meas=meas_cpu[:cutoff],
-            train_field=field_cpu[:cutoff],
-            train_targ=targ_cpu[:cutoff],
-            test_meas=meas_cpu[cutoff:],
-            test_field=field_cpu[cutoff:],
-            test_targ=targ_cpu[cutoff:],
-            inp_np=arr_in,
-        )
-
-        train_meas.append(meas_cpu[:cutoff])
-        train_field.append(field_cpu[:cutoff])
-        train_targ.append(targ_cpu[:cutoff])
-
-    if len(train_meas) == 0:
+    # simulate every file once (seeded reservoir, equal-length files batched)
+    pde_res, splits = simulate_dataset(cfg, device)
+    if not splits:
         raise RuntimeError("No training data produced. Check processed_dir and data shapes.")
 
-    all_train_meas = torch.cat(train_meas, dim=0)
-    all_train_field = torch.cat(train_field, dim=0)
-    all_train_targ = torch.cat(train_targ, dim=0)
-
-    # readout + trainer
-    readout = AttentionReadout2DPDE(
-        num_sensors=pde_res.num_sensors,  # source of truth
-        output_dim=cfg.output_dim,
-        n_queries=cfg.n_queries,
-        hidden_dim=cfg.hidden_dim,
-        static_positions=cfg.static_positions,
-        use_linear_model=cfg.use_linear_model,
-    ).to(device)
-
-    # IMPORTANT: dataset includes fields (u_{t+T})
-    # NOTE: fields are float16 CPU tensors; move to GPU per batch.
-    loader = DataLoader(
-        TensorDataset(all_train_meas, all_train_field, all_train_targ),
-        batch_size=min(cfg.batch_size, 64),  # fields are big; keep this moderate
-        shuffle=True,
-        drop_last=False,
+    kind = "linear" if cfg.use_linear_model else ("static" if cfg.static_positions else "adaptive")
+    readout, data_hist, repel_hist = train_readout(
+        cfg, splits, kind, device, target_mode=cfg.target_mode, return_history=True
     )
 
-    trainer = PDETrainer(readout, pde_res, lr=cfg.lr, final_lr=cfg.final_lr, device=device)
-    data_hist, repel_hist = trainer.train_loop(
-        loader, n_epochs=cfg.epochs, repulsion_coef=cfg.repulsion_coef
-    )
-
-    # metrics
-    readout.eval()
-    mse = torch.nn.MSELoss()
-
-    # Global train MSE
-    with torch.no_grad():
-        pred_train = readout(all_train_meas.to(device), all_train_field.to(device)).cpu()
-        train_mse = mse(pred_train, all_train_targ).item()
-
-    # Global test MSE
-    test_meas, test_field, test_targ = [], [], []
-    for d in filewise.values():
-        if d["test_meas"].numel():
-            test_meas.append(d["test_meas"])
-            test_field.append(d["test_field"])
-            test_targ.append(d["test_targ"])
-
-    if test_meas:
-        all_test_meas = torch.cat(test_meas, dim=0)
-        all_test_field = torch.cat(test_field, dim=0)
-        all_test_targ = torch.cat(test_targ, dim=0)
-        with torch.no_grad():
-            pred_test = readout(all_test_meas.to(device), all_test_field.to(device)).cpu()
-            test_mse = mse(pred_test, all_test_targ).item()
-    else:
-        test_mse = float("nan")
-
-    # Build metrics dict early
+    per_file = evaluate_readout(readout, splits, device, part="train")
+    per_file_test = evaluate_readout(readout, splits, device, part="test")
+    n_train = sum(len(s.train[2]) for s in splits)
+    n_test = sum(len(s.test[2]) for s in splits)
     out = {
-        "train_mse": train_mse,
-        "test_mse": test_mse,
+        "readout": kind,
+        "target_mode": cfg.target_mode,
+        "train_mse": sum(v["mse"] * len(s.train[2]) for s, v in zip(splits, per_file.values()))
+        / n_train,
+        "test_mse": (
+            sum(
+                per_file_test[s.name]["mse"] * len(s.test[2])
+                for s in splits
+                if s.name in per_file_test
+            )
+            / n_test
+            if n_test
+            else float("nan")
+        ),
         "data_loss": data_hist,
         "repel_loss": repel_hist,
+        "per_file_train_mse": {k: v["mse"] for k, v in per_file.items()},
+        "per_file_test_mse": {k: v["mse"] for k, v in per_file_test.items()},
+        "per_file_persistence_mse": {k: v["persistence_mse"] for k, v in per_file_test.items()},
     }
 
-    # --- Per-file MSE (sanity check) ---
-    per_file = {}
-    with torch.no_grad():
-        for fname, d in filewise.items():
-            tm = d["train_meas"]
-            tf = d["train_field"]
-            tt = d["train_targ"]
+    if cfg.forecast_steps > 0:
+        out["closed_loop_vpt_steps"] = forecast_vpt(
+            pde_res, readout, splits, device, cfg.forecast_warmup, cfg.forecast_steps
+        )
 
-            if tm.numel() == 0:
-                per_file[fname] = float("nan")
-                continue
-
-            pred = readout(tm.to(device), tf.to(device)).cpu()
-            per_file[fname] = mse(pred, tt).item()
-
-    out["per_file_train_mse"] = per_file
-
-    # --- Save debug bundles for plotting (first n points per file) ---
+    # debug bundles for plotting (first n training points per file)
     debug_n = 1000
-    for fname, d in filewise.items():
-        n = min(debug_n, d["train_meas"].shape[0])
+    for s in splits:
+        n = min(debug_n, s.train[0].shape[0])
         if n <= 0:
             continue
         torch.save(
             {
-                "fname": fname,
-                "meas": d["train_meas"][:n],
-                "field": d["train_field"][:n],
-                "targ": d["train_targ"][:n],
+                "fname": s.name,
+                "meas": s.train[0][:n],
+                "field": s.train[1][:n],
+                "targ": s.train[2][:n],
             },
-            run_dir / f"debug_{fname}.pt",
+            run_dir / f"debug_{s.name}.pt",
         )
 
-    # Finally write metrics.json once, with everything included
     with open(run_dir / "metrics.json", "w") as f:
         json.dump(out, f, indent=2)
 
-    # save models
     torch.save(readout.state_dict(), run_dir / "readout.pt")
     torch.save(pde_res.state_dict(), run_dir / "pde.pt")
 
-    # optional correlations: DISABLE for now unless you update compute_correlation_mats to accept fields
-    # Current diagnostics module likely assumes readout(meas, pde_res). Leave off to avoid silent wrong results.
+    # correlation diagnostics of what the readout looks at (first file, first corr_steps inputs)
     if cfg.save_corr:
-        print(
-            "NOTE: save_corr=True but compute_correlation_mats must be updated for (meas, field_u). Skipping corr."
+        c_plain, c_weighted, c_weights = compute_correlation_mats(
+            pde_res, readout, splits[0].inputs[: cfg.corr_steps], device
+        )
+        np.savez(
+            run_dir / "correlations.npz", plain=c_plain, weighted=c_weighted, weights=c_weights
         )
 
+    print(f"train MSE {out['train_mse']:.5f} | test MSE {out['test_mse']:.5f}")
     print("Done. Saved to:", run_dir)
 
 

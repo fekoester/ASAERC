@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
-from typing import Callable, List
+from collections.abc import Callable
 
 import numpy as np
 from scipy.integrate import solve_ivp
@@ -226,7 +226,7 @@ def main():
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    systems: List[DynamicalSystem] = [
+    systems: list[DynamicalSystem] = [
         LorenzSystem(),
         RoesslerSystem(),
         VanDerPol(mu=3.0),
