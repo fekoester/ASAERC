@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -21,7 +20,9 @@ class PDETrainer:
         self.optimizer = optim.Adam(self.readout.parameters(), lr=lr)
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=1, eta_min=final_lr)
 
-    def train_loop(self, dataloader, n_epochs: int = 10, repulsion_coef: float = 0.0):
+    def train_loop(
+        self, dataloader, n_epochs: int = 10, repulsion_coef: float = 0.0, verbose: bool = True
+    ):
         """
         Trains readout on tuples (meas_fixed(u_{t+T}), field(u_{t+T}), target).
         This guarantees adaptive sensing samples the correct u_{t+T} for each sample,
@@ -79,8 +80,10 @@ class PDETrainer:
             repel_loss_history.append(avg_repel)
 
             lr = self.optimizer.param_groups[0]["lr"]
-            print(
-                f"[epoch {epoch + 1:4d}/{n_epochs}] loss={avg_data:.6f} repel={avg_repel:.6f} lr={lr:.3e}"
-            )
+            if verbose:
+                print(
+                    f"[epoch {epoch + 1:4d}/{n_epochs}] loss={avg_data:.6f} "
+                    f"repel={avg_repel:.6f} lr={lr:.3e}"
+                )
 
         return data_loss_history, repel_loss_history

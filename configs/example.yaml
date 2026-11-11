@@ -35,3 +35,11 @@ repulsion_coef: 0.0
 seed: 0
 save_dir: "runs"
 save_corr: true
+corr_steps: 500
+
+# "next": predict y_{t+1}; "delta": predict the change y_{t+1} - x_t
+target_mode: "next"
+
+# Closed-loop forecast on each test segment (0 disables): valid prediction time in metrics.json
+forecast_steps: 200
+forecast_warmup: 200
